@@ -100,6 +100,10 @@ public class MessageHandler {
 
                     int character = msgIn.read();
 
+                    // EOF: stream closed or exhausted, don't spin on -1
+                    if (character == -1)
+                        break;
+
                     // Detected STX
                     if (character == 0x02) {
                         character = msgIn.read();
@@ -164,7 +168,9 @@ public class MessageHandler {
 
                 } catch (InterruptedException e) {
 
-                    throw new RuntimeException(e);
+                    // interrupted by stopProcessing(): exit cleanly
+                    Thread.currentThread().interrupt();
+                    return;
                 }
             }
 
@@ -245,6 +251,12 @@ public class MessageHandler {
 
             isProcessing.set(false);
         }
+
+        // unblock the worker threads: the notifier may be parked in
+        // messageQueue.wait() and the reader in msgIn.read(); without this
+        // they leak on every module restart
+        messageNotifier.interrupt();
+        messageReader.interrupt();
 
         webIdScheduler.shutdown();
         try {
