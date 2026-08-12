@@ -38,6 +38,26 @@ public class CandidateAggregator {
         }
     }
 
+    /**
+     * A burned-in camera overlay is text that never moves, sits against a frame
+     * edge, runs most of the way across it and is therefore read on virtually
+     * every sampled frame. Real painted markings on a vehicle trip none of these
+     * while the vehicle is driving through the lane.
+     */
+    static final int STATIC_BOX_TOLERANCE_PX = 6;
+    static final double EDGE_BAND_FRACTION = 0.12;
+    static final double WIDE_BOX_FRACTION = 0.4;
+    /** Overlay likelihood at or above which a candidate is not published at all. */
+    static final double OVERLAY_DROP_LIKELIHOOD = 0.6;
+
+    /** Weight of a valid ISO 6346 check digit, in units of recognizer confidence. */
+    static final double CHECKSUM_WEIGHT = 0.35;
+    /** Frame agreement is only a tie-break: on real footage an overlay is read on
+     *  every frame while a container number is legible on one or two. */
+    static final double READ_COUNT_WEIGHT = 0.05;
+    static final int READ_COUNT_SATURATION = 4;
+    static final double OVERLAY_WEIGHT = 0.6;
+
     /** An aggregated candidate plus the evidence frame/box it was best read from. */
     public static class Candidate {
         public final String idType;
@@ -50,9 +70,50 @@ public class CandidateAggregator {
         public Instant frameTime;
         public BufferedImage evidenceFrame;
         public Rectangle evidenceBox;
+        /** True when every read of this value had its check digit recomputed. */
+        public boolean checkDigitRepaired;
+        /** 0..1: how much this candidate behaves like a burned-in camera overlay. */
+        public double overlayLikelihood;
+        public double score;
+
+        private Rectangle firstBox;
+        private int staticReads;
+        private int edgeBandReads;
+        private int wideReads;
 
         Candidate(String idType) {
             this.idType = idType;
+        }
+
+        void noteGeometry(Rectangle box, BufferedImage frame) {
+            if (firstBox == null)
+                firstBox = box;
+            else if (Math.abs(box.x - firstBox.x) <= STATIC_BOX_TOLERANCE_PX
+                    && Math.abs(box.y - firstBox.y) <= STATIC_BOX_TOLERANCE_PX
+                    && Math.abs(box.width - firstBox.width) <= STATIC_BOX_TOLERANCE_PX)
+                staticReads++;
+
+            if (frame == null || frame.getWidth() == 0 || frame.getHeight() == 0)
+                return;
+            double centreY = (box.y + box.height / 2.0) / frame.getHeight();
+            if (centreY <= EDGE_BAND_FRACTION || centreY >= 1 - EDGE_BAND_FRACTION)
+                edgeBandReads++;
+            if (box.width / (double) frame.getWidth() >= WIDE_BOX_FRACTION)
+                wideReads++;
+        }
+
+        /** All four overlay cues must agree, so a container number scores ~0 here. */
+        void scoreOverlay(int totalFrames) {
+            if (readCount < 2 || totalFrames < 2) {
+                overlayLikelihood = 0;
+                return;
+            }
+            double stable = staticReads / (double) (readCount - 1);
+            double coverage = Math.min(1, readCount / (double) totalFrames);
+            overlayLikelihood = stable
+                    * (edgeBandReads / (double) readCount)
+                    * (wideReads / (double) readCount)
+                    * coverage;
         }
     }
 
@@ -62,7 +123,12 @@ public class CandidateAggregator {
         this.settings = settings;
     }
 
-    public List<Candidate> aggregate(List<FrameRead> frameReads) {
+    public List<Candidate> aggregate(List<FrameRead> allFrameReads) {
+        List<FrameRead> frameReads = new ArrayList<>();
+        for (FrameRead frameRead : allFrameReads)
+            if (!inIgnoredBand(frameRead))
+                frameReads.add(frameRead);
+
         Map<String, Candidate> byKey = new LinkedHashMap<>();
 
         for (FrameRead frameRead : frameReads) {
@@ -73,10 +139,10 @@ public class CandidateAggregator {
             Iso6346.Match container = settings.readContainerIds ? Iso6346.scan(normalized) : null;
             if (container != null)
                 merge(byKey, frameRead, VehicleOcrResult.ID_TYPE_CONTAINER,
-                        container.value, container.checksumValid);
+                        container.value, container.checksumValid, container.checkDigitRepaired);
 
             if (settings.readPlates && container == null && PlateHeuristics.looksLikePlate(normalized))
-                merge(byKey, frameRead, VehicleOcrResult.ID_TYPE_PLATE, normalized, false);
+                merge(byKey, frameRead, VehicleOcrResult.ID_TYPE_PLATE, normalized, false, false);
         }
 
         if (settings.readContainerIds)
@@ -94,12 +160,28 @@ public class CandidateAggregator {
             double floor = VehicleOcrResult.ID_TYPE_CONTAINER.equals(candidate.idType)
                     ? settings.containerMinConfidence
                     : settings.plateMinConfidence;
-            return !candidate.checksumValid && candidate.confidence < floor;
+            // a recomputed check digit vouches for nothing the recognizer read,
+            // so it does not earn the waiver a read-and-validated one does
+            boolean vouchedFor = candidate.checksumValid && !candidate.checkDigitRepaired;
+            return !vouchedFor && candidate.confidence < floor;
         });
 
-        candidates.sort(Comparator
-                .comparing((Candidate c) -> c.checksumValid).reversed()
-                .thenComparing(Comparator.comparingDouble((Candidate c) -> c.confidence).reversed()));
+        int totalFrames = countFrames(frameReads);
+        for (Candidate candidate : candidates) {
+            candidate.scoreOverlay(totalFrames);
+            candidate.score = candidate.confidence
+                    + (candidate.checksumValid ? CHECKSUM_WEIGHT : 0)
+                    + READ_COUNT_WEIGHT
+                            * Math.min(candidate.readCount, READ_COUNT_SATURATION) / READ_COUNT_SATURATION
+                    - OVERLAY_WEIGHT * candidate.overlayLikelihood;
+        }
+
+        // Publishing an overlay can only mislead the operator, and dropping it
+        // here keeps the published order the same one the viewer recomputes from
+        // the fields on the record.
+        candidates.removeIf(candidate -> candidate.overlayLikelihood >= OVERLAY_DROP_LIKELIHOOD);
+
+        candidates.sort(Comparator.comparingDouble((Candidate c) -> c.score).reversed());
 
         List<Candidate> capped = new ArrayList<>();
         int containers = 0, plates = 0;
@@ -133,7 +215,9 @@ public class CandidateAggregator {
                 // counted in the per-read pass above
                 boolean alreadyValid = line.stream().anyMatch(read -> {
                     Iso6346.Match match = Iso6346.scan(Iso6346.normalize(read.read.text));
-                    return match != null && match.checksumValid;
+                    // a repaired read still leaves the printed check digit unread,
+                    // so let the concatenation try to recover it for real
+                    return match != null && match.checksumValid && !match.checkDigitRepaired;
                 });
                 if (alreadyValid)
                     continue;
@@ -153,7 +237,8 @@ public class CandidateAggregator {
 
                 FrameRead synthetic = new FrameRead(new OcrRead(joinedRaw, confidence, union),
                         line.get(0).frameImage, line.get(0).cameraUid, line.get(0).frameTime);
-                merge(byKey, synthetic, VehicleOcrResult.ID_TYPE_CONTAINER, match.value, match.checksumValid);
+                merge(byKey, synthetic, VehicleOcrResult.ID_TYPE_CONTAINER,
+                        match.value, match.checksumValid, match.checkDigitRepaired);
             }
         }
     }
@@ -184,12 +269,38 @@ public class CandidateAggregator {
         return overlap >= Math.min(a.height, b.height) * 0.5;
     }
 
-    private void merge(Map<String, Candidate> byKey, FrameRead frameRead,
-                       String idType, String normalizedValue, boolean checksumValid) {
+    /** True when the read sits in a frame edge band the lane has configured away. */
+    private boolean inIgnoredBand(FrameRead frameRead) {
+        if (settings.ignoreTopFraction <= 0 && settings.ignoreBottomFraction <= 0)
+            return false;
+        BufferedImage frame = frameRead.frameImage;
+        if (frame == null || frame.getHeight() == 0)
+            return false;
+        Rectangle box = frameRead.read.bbox;
+        double centreY = (box.y + box.height / 2.0) / frame.getHeight();
+        return centreY <= settings.ignoreTopFraction
+                || centreY >= 1 - settings.ignoreBottomFraction;
+    }
+
+    private static int countFrames(List<FrameRead> frameReads) {
+        Map<BufferedImage, Boolean> frames = new LinkedHashMap<>();
+        for (FrameRead frameRead : frameReads)
+            frames.put(frameRead.frameImage, Boolean.TRUE);
+        return frames.size();
+    }
+
+    private void merge(Map<String, Candidate> byKey, FrameRead frameRead, String idType,
+                       String normalizedValue, boolean checksumValid, boolean checkDigitRepaired) {
         Candidate candidate = byKey.computeIfAbsent(idType + ":" + normalizedValue,
                 key -> new Candidate(idType));
+        boolean first = candidate.readCount == 0;
         candidate.readCount++;
         candidate.checksumValid |= checksumValid;
+        // one read that carried its own valid check digit settles it for the value
+        candidate.checkDigitRepaired = first
+                ? checkDigitRepaired
+                : candidate.checkDigitRepaired && checkDigitRepaired;
+        candidate.noteGeometry(frameRead.read.bbox, frameRead.frameImage);
 
         float confidence = frameRead.read.confidence;
         if (candidate.value == null || confidence > candidate.confidence) {

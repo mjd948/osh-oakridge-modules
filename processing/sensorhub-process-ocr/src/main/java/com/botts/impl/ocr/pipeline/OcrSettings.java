@@ -12,4 +12,8 @@ public class OcrSettings {
     public int framesPerVideo = 8;
     public double containerMinConfidence = 0.5;
     public double plateMinConfidence = 0.6;
+    /** Ignore reads whose box centre lies in this fraction of the frame's top edge. 0 = off. */
+    public double ignoreTopFraction = 0;
+    /** Ignore reads whose box centre lies in this fraction of the frame's bottom edge. 0 = off. */
+    public double ignoreBottomFraction = 0;
 }

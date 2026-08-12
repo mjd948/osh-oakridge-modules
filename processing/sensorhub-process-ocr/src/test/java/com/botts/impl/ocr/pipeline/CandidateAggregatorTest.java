@@ -95,15 +95,33 @@ public class CandidateAggregatorTest {
     }
 
     @Test
-    public void sortsChecksumValidFirstThenConfidence() {
+    public void checksumValidityOutweighsAModestConfidenceEdge() {
         List<CandidateAggregator.FrameRead> reads = List.of(
-                read("CSQU3054384", 0.95f),  // pattern-only, above floor
+                read("CSQU3O54384", 0.8f),   // pattern-only: coerced serial, so not repairable
                 read("TEMU1234565", 0.6f));  // checksum valid, lower confidence
 
         List<CandidateAggregator.Candidate> candidates = new CandidateAggregator(settings()).aggregate(reads);
 
         assertEquals(2, candidates.size());
         assertEquals("TEMU1234565", candidates.get(0).normalizedValue);
+    }
+
+    /**
+     * A valid check digit is a weak discriminator — roughly one misread in
+     * eleven validates by chance — so it is weighted, not absolute. Live on lane
+     * NSDD4 the chance-valid TTBU3558532 at 0.687 outranked the correct read of
+     * TGBU 355853 7 because of the old checksum-first sort.
+     */
+    @Test
+    public void aMuchStrongerReadOutranksAChanceValidOne() {
+        List<CandidateAggregator.FrameRead> reads = List.of(
+                read("TTBU3558532", 0.687f),    // checksum valid, but the wrong owner code
+                read("TGBU 355853 Z", 0.967f)); // check digit misread; repairs to ...537
+
+        List<CandidateAggregator.Candidate> candidates = new CandidateAggregator(settings()).aggregate(reads);
+
+        assertEquals("TGBU3558537", candidates.get(0).normalizedValue);
+        assertTrue(candidates.get(0).checkDigitRepaired);
     }
 
     @Test
@@ -136,13 +154,68 @@ public class CandidateAggregatorTest {
 
     @Test
     public void doesNotConcatenateAcrossLines() {
-        // same reads but vertically far apart: no line concatenation
+        // vertically far apart, and neither half is a container number on its own
         List<CandidateAggregator.FrameRead> reads = List.of(
-                read("CSQU 305438", 0.9f, new Rectangle(10, 50, 200, 30)),
-                read("3", 0.8f, new Rectangle(10, 300, 20, 28)));
+                read("CSQU 30543", 0.9f, new Rectangle(10, 50, 200, 30)),
+                read("83", 0.8f, new Rectangle(10, 300, 20, 28)));
 
         List<CandidateAggregator.Candidate> candidates = new CandidateAggregator(settings()).aggregate(reads);
         assertTrue(candidates.stream().noneMatch(c -> "CSQU3054383".equals(c.normalizedValue)));
+    }
+
+    /**
+     * Geometry taken from real footage (lane NSDD4, clip 2026-08-12_20-07-33):
+     * the burned-in banner is read at x=274,y=2,w=364 on all seven sampled
+     * frames of a 640x480 clip, while the container number moves from
+     * (171,253) to (428,189) and is only legible on two of them.
+     */
+    private List<CandidateAggregator.FrameRead> bannerAndContainerFrames() {
+        List<CandidateAggregator.FrameRead> reads = new ArrayList<>();
+        Rectangle[] containerBoxes = {new Rectangle(171, 253, 115, 31), new Rectangle(428, 189, 80, 16)};
+        for (int i = 0; i < 7; i++) {
+            BufferedImage frame = new BufferedImage(640, 480, BufferedImage.TYPE_3BYTE_BGR);
+            reads.add(new CandidateAggregator.FrameRead(
+                    new OcrRead("BANZO260328", 0.96f, new Rectangle(274 + i % 2, 2 + i % 3, 364, 18)),
+                    frame, "cam", Instant.now()));
+            if (i < containerBoxes.length)
+                reads.add(new CandidateAggregator.FrameRead(
+                        new OcrRead("TGBU 355853 Z", 0.89f, containerBoxes[i]), frame, "cam", Instant.now()));
+        }
+        return reads;
+    }
+
+    @Test
+    public void dropsTextThatBehavesLikeABurnedInCameraOverlay() {
+        List<CandidateAggregator.Candidate> candidates =
+                new CandidateAggregator(settings()).aggregate(bannerAndContainerFrames());
+
+        assertTrue(candidates.stream().noneMatch(c -> "BANZ0260328".equals(c.normalizedValue)));
+        assertEquals("TGBU3558537", candidates.get(0).normalizedValue);
+    }
+
+    @Test
+    public void keepsAMovingContainerNumberEvenThoughItIsReadOnFewerFrames() {
+        List<CandidateAggregator.Candidate> candidates =
+                new CandidateAggregator(settings()).aggregate(bannerAndContainerFrames());
+
+        CandidateAggregator.Candidate container = candidates.get(0);
+        assertEquals(2, container.readCount);
+        assertEquals(0, container.overlayLikelihood, 1e-9);
+    }
+
+    @Test
+    public void ignoreBandDropsEdgeReadsAndIsInertWhenZero() {
+        OcrSettings banded = settings();
+        banded.ignoreTopFraction = 0.1;
+        assertTrue(new CandidateAggregator(banded).aggregate(bannerAndContainerFrames()).stream()
+                .noneMatch(c -> "BANZ0260328".equals(c.normalizedValue)));
+
+        // a container read high in the frame survives with the band switched off
+        BufferedImage frame = new BufferedImage(640, 480, BufferedImage.TYPE_3BYTE_BGR);
+        CandidateAggregator.FrameRead high = new CandidateAggregator.FrameRead(
+                new OcrRead("CSQU3054383", 0.9f, new Rectangle(10, 4, 120, 20)), frame, "cam", Instant.now());
+        assertEquals(1, new CandidateAggregator(settings()).aggregate(List.of(high)).size());
+        assertTrue(new CandidateAggregator(banded).aggregate(List.of(high)).isEmpty());
     }
 
     @Test

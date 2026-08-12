@@ -59,4 +59,14 @@ public class OcrConfig {
     @DisplayInfo(label = "Plate Autofill Confidence", desc = "The operator UI only auto-fills a plate at or "
             + "above this confidence; below it, the read is offered as a click-to-apply suggestion.")
     public double plateAutofillConfidence = 0.85;
+
+    @DisplayInfo(label = "Ignore Top Of Frame", desc = "Fraction of the frame's top edge to ignore, for "
+            + "cameras whose burned-in name/timestamp banner is read as vehicle text. 0 disables it; "
+            + "0.1 ignores the top tenth. Leave at 0 unless a banner is still getting through, since this "
+            + "also hides any real markings that high in the frame.")
+    public double ignoreTopFraction = 0;
+
+    @DisplayInfo(label = "Ignore Bottom Of Frame", desc = "Fraction of the frame's bottom edge to ignore. "
+            + "0 disables it.")
+    public double ignoreBottomFraction = 0;
 }

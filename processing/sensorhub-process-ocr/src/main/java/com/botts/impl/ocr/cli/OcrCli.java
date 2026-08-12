@@ -47,8 +47,15 @@ public class OcrCli {
                 List<BufferedImage> images = new ArrayList<>();
 
                 if (file.getName().toLowerCase(Locale.US).endsWith(".mp4")) {
-                    for (Mp4FrameSampler.Frame frame : new Mp4FrameSampler().sample(file.getAbsolutePath(), settings.framesPerVideo))
-                        images.add(frame.image);
+                    try {
+                        for (Mp4FrameSampler.Frame frame : new Mp4FrameSampler().sample(file.getAbsolutePath(), settings.framesPerVideo))
+                            images.add(frame.image);
+                    } catch (Exception e) {
+                        // a truncated clip must not abandon the rest of a sweep;
+                        // the processor skips these per-clip too
+                        System.err.println("  unreadable clip, skipping: " + e.getMessage());
+                        continue;
+                    }
                 } else {
                     BufferedImage image = ImageIO.read(file);
                     if (image == null) {
@@ -69,9 +76,12 @@ public class OcrCli {
 
                 System.out.printf(Locale.US, "  -- %d frame(s) in %d ms --%n", images.size(), elapsedMs);
                 for (CandidateAggregator.Candidate candidate : new CandidateAggregator(settings).aggregate(frameReads)) {
-                    System.out.printf(Locale.US, "  candidate: %-9s %-14s conf=%.2f reads=%d checksum=%s%n",
-                            candidate.idType, candidate.normalizedValue, candidate.confidence,
-                            candidate.readCount, candidate.checksumValid ? "VALID" : "-");
+                    System.out.printf(Locale.US,
+                            "  candidate: %-9s %-14s score=%.3f conf=%.2f reads=%d checksum=%-9s overlay=%.2f%n",
+                            candidate.idType, candidate.normalizedValue, candidate.score, candidate.confidence,
+                            candidate.readCount,
+                            candidate.checksumValid ? (candidate.checkDigitRepaired ? "REPAIRED" : "VALID") : "-",
+                            candidate.overlayLikelihood);
                 }
             }
         }

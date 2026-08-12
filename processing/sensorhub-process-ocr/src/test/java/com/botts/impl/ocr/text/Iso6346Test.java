@@ -71,9 +71,12 @@ public class Iso6346Test {
 
     @Test
     public void scanReportsPatternOnlyMatchWhenNothingValidates() {
-        Iso6346.Match match = Iso6346.scan("CSQU3054384");
+        // the serial had to be coerced from a letter, so the check digit cannot
+        // be recomputed either — all that is left is the pattern-only window
+        Iso6346.Match match = Iso6346.scan("CSQU3O54384");
         assertNotNull(match);
         assertFalse(match.checksumValid);
+        assertFalse(match.checkDigitRepaired);
         assertEquals("CSQU3054384", match.value);
     }
 
@@ -111,10 +114,51 @@ public class Iso6346Test {
         // same banner with the separators already dropped by the OCR engine, so
         // the timestamp strip cannot see it: CAM + 2026032 + 8 -> CAMZ0260328
         assertNull(Iso6346.scan("CAM20260328115632"));
-        // a genuine category letter still yields a pattern-only candidate
-        Iso6346.Match match = Iso6346.scan("CSQU3054384");
+        // a genuine category letter still yields a candidate
+        Iso6346.Match match = Iso6346.scan("CSQU3O54384");
         assertNotNull(match);
         assertFalse(match.checksumValid);
+    }
+
+    /**
+     * The check digit is printed small and boxed on its own, so it is the
+     * character the recognizer misses most: real footage of TGBU 355853 7 comes
+     * back as "TGBU 355853 Z" or as "TGBU355853" with the digit dropped
+     * entirely. Both recover the real number (observed live 2026-08-12, lane
+     * NSDD4, where the raw reads were 0.89-0.93 confidence).
+     */
+    @Test
+    public void recomputesACheckDigitThatWasMisreadOrMissed() {
+        assertEquals("TGBU3558537", Iso6346.repairCheckDigit("TGBU355853"));
+
+        Iso6346.Match misread = Iso6346.scan(Iso6346.normalize("TGBU 355853 Z"));
+        assertNotNull(misread);
+        assertEquals("TGBU3558537", misread.value);
+        assertTrue(misread.checksumValid);
+        assertTrue(misread.checkDigitRepaired);
+
+        Iso6346.Match missing = Iso6346.scan(Iso6346.normalize("TGBU355853 "));
+        assertNotNull(missing);
+        assertEquals("TGBU3558537", missing.value);
+        assertTrue(missing.checkDigitRepaired);
+    }
+
+    @Test
+    public void doesNotRepairAPrefixThatNeededCoercion() {
+        // owner code coerced from digits, serial coerced from letters and a
+        // category identifier that was never a letter: nothing to trust
+        assertNull(Iso6346.scan("CAM20260328115632"));
+        Iso6346.Match coercedSerial = Iso6346.scan("TGBU3558S3Z");
+        assertNotNull(coercedSerial);
+        assertFalse(coercedSerial.checkDigitRepaired);
+    }
+
+    @Test
+    public void aReadCheckDigitStillWinsOverARepairedOne() {
+        Iso6346.Match match = Iso6346.scan(Iso6346.normalize("TGBU 355853 7"));
+        assertNotNull(match);
+        assertTrue(match.checksumValid);
+        assertFalse(match.checkDigitRepaired);
     }
 
     @Test

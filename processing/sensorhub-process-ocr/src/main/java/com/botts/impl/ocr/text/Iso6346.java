@@ -23,9 +23,9 @@ public final class Iso6346 {
     // colon or a calendar date, so dropping those substrings costs nothing and
     // leaves any genuine text sharing the line intact.
     private static final Pattern TIMESTAMP = Pattern.compile(
-            "\\d{4}[-/]\\d{2}[-/]\\d{2}"        // 2026-03-28, 2026/03/28
-                    + "|\\d{2}[-/]\\d{2}[-/]\\d{4}"  // 28-03-2026
-                    + "|\\d{1,2}:\\d{2}(?::\\d{2})?" // 11:56:32, 11:56
+            "\\d{4}[-/.]\\d{2}[-/.]\\d{2}"        // 2026-03-28, 2026/03/28, 2026.03.28
+                    + "|\\d{2}[-/.]\\d{2}[-/.]\\d{4}"  // 28-03-2026
+                    + "|\\d{1,2}:\\d{2}(?::\\d{2})?"   // 11:56:32, 11:56
     );
 
     // ISO 6346 letter values count up from A=10 but never use multiples of 11
@@ -122,26 +122,66 @@ public final class Iso6346 {
         return checkDigit(s) == s.charAt(10) - '0';
     }
 
+    /** Appends the check digit that ISO 6346 requires for these 10 characters. */
+    public static String repairCheckDigit(String first10) {
+        return first10 + (char) ('0' + checkDigit(first10));
+    }
+
+    /**
+     * True when the owner code, category identifier and serial were all read as
+     * the character class ISO 6346 requires, with no positional coercion. Only
+     * such a prefix may have its check digit recomputed: the repair trusts
+     * characters 1-10 completely, so one coerced character there would launder a
+     * misread into a confident-looking number.
+     */
+    private static boolean prefixReadCleanly(String source) {
+        if (source == null || source.length() < 10)
+            return false;
+        for (int i = 0; i < 3; i++)
+            if (!Character.isLetter(source.charAt(i)))
+                return false;
+        char category = source.charAt(3);
+        if (category != 'U' && category != 'J' && category != 'Z')
+            return false;
+        for (int i = 4; i < 10; i++)
+            if (!Character.isDigit(source.charAt(i)))
+                return false;
+        return true;
+    }
+
     /** A container-number match found inside a longer OCR string. */
     public static class Match {
         public final String value;
         public final boolean checksumValid;
+        /** True when the check digit was recomputed rather than read. */
+        public final boolean checkDigitRepaired;
 
-        Match(String value, boolean checksumValid) {
+        Match(String value, boolean checksumValid, boolean checkDigitRepaired) {
             this.value = value;
             this.checksumValid = checksumValid;
+            this.checkDigitRepaired = checkDigitRepaired;
         }
     }
 
     /**
      * Slides an 11-char window over a normalized string, applying positional
-     * coercion to each window. Returns the first checksum-valid match, or the
-     * first pattern-only match when nothing validates, or null.
+     * coercion to each window, and prefers in order: a window whose check digit
+     * was read and validates; a cleanly-read owner code and serial whose check
+     * digit is recomputed; a pattern-only window.
+     *
+     * The check digit is the character the recognizer gets wrong most often on
+     * real footage — it is printed small and boxed on its own, so "TGBU 355853 7"
+     * comes back as "TGBU 355853 Z" and the correct number fails validation,
+     * while a chance-valid misread of another character wins the ranking. It is
+     * also redundant information, fully determined by the other ten, so
+     * recomputing it recovers the real number instead of publishing a
+     * known-wrong one.
      */
     public static Match scan(String normalized) {
-        if (normalized == null || normalized.length() < LENGTH)
+        if (normalized == null || normalized.length() < LENGTH - 1)
             return null;
 
+        Match repaired = null;
         Match patternOnly = null;
         for (int i = 0; i + LENGTH <= normalized.length(); i++) {
             String source = normalized.substring(i, i + LENGTH);
@@ -149,15 +189,30 @@ public final class Iso6346 {
             if (!matchesPattern(window))
                 continue;
             if (isValid(window))
-                return new Match(window, true);
+                return new Match(window, true, false);
+            if (repaired == null && prefixReadCleanly(source))
+                repaired = new Match(repairCheckDigit(window.substring(0, 10)), true, true);
             // With no check digit to vouch for it, a window whose category
             // identifier was manufactured by coercion is not trustworthy: '2'
             // is the only digit that coerces to a valid category (Z), so this
             // is nearly always a run of digits that happened to follow three
             // letters rather than a Z-category container read as a digit.
             if (patternOnly == null && !Character.isDigit(source.charAt(3)))
-                patternOnly = new Match(window, false);
+                patternOnly = new Match(window, false, false);
         }
-        return patternOnly;
+
+        // The check digit is boxed separately on real containers, so it is also
+        // routinely missed altogether, leaving a 10-character read.
+        if (repaired == null) {
+            for (int i = 0; i + LENGTH - 1 <= normalized.length(); i++) {
+                String source = normalized.substring(i, i + LENGTH - 1);
+                if (!prefixReadCleanly(source))
+                    continue;
+                repaired = new Match(repairCheckDigit(source), true, true);
+                break;
+            }
+        }
+
+        return repaired != null ? repaired : patternOnly;
     }
 }

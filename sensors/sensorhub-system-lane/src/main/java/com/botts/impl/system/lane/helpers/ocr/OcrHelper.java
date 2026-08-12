@@ -209,6 +209,8 @@ public class OcrHelper {
         settings.framesPerVideo = config.framesPerVideo;
         settings.containerMinConfidence = config.containerMinConfidence;
         settings.plateMinConfidence = config.plateMinConfidence;
+        settings.ignoreTopFraction = config.ignoreTopFraction;
+        settings.ignoreBottomFraction = config.ignoreBottomFraction;
         return settings;
     }
 
