@@ -83,4 +83,46 @@ public class Iso6346Test {
         assertNull(Iso6346.scan(""));
         assertNull(Iso6346.scan(null));
     }
+
+    @Test
+    public void stripsBurnedInTimestamps() {
+        assertEquals("L102 REAR CAM    ", Iso6346.stripTimestamps("L102 REAR CAM 2026-03-28 11:56:32"));
+        assertEquals(" ", Iso6346.stripTimestamps("2026/03/28"));
+        assertEquals(" ", Iso6346.stripTimestamps("28-03-2026"));
+        assertEquals("", Iso6346.stripTimestamps(null));
+        // a container number's own separators must survive
+        assertEquals("csqu 305438-3", Iso6346.stripTimestamps("csqu 305438-3"));
+    }
+
+    /**
+     * Regression: the Marshall lane camera's OSD banner was read on 8/8 sampled
+     * frames of every clip and surfaced as container candidate CAMZ0260328 at
+     * 0.96 confidence, crowding a real candidate out of the operator's
+     * suggestions (observed live 2026-08-12 on datastream 0jag2).
+     */
+    @Test
+    public void doesNotReadCameraOsdBannerAsContainer() {
+        assertNull(Iso6346.scan(Iso6346.normalize("L102 REAR CAM 2026-03-28 11:56:32")));
+        assertNull(Iso6346.scan(Iso6346.normalize("L102REARCAM 2026-03-2811:56:32")));
+    }
+
+    @Test
+    public void rejectsPatternOnlyWindowWhoseCategoryWasCoercedFromADigit() {
+        // same banner with the separators already dropped by the OCR engine, so
+        // the timestamp strip cannot see it: CAM + 2026032 + 8 -> CAMZ0260328
+        assertNull(Iso6346.scan("CAM20260328115632"));
+        // a genuine category letter still yields a pattern-only candidate
+        Iso6346.Match match = Iso6346.scan("CSQU3054384");
+        assertNotNull(match);
+        assertFalse(match.checksumValid);
+    }
+
+    @Test
+    public void stillReadsRealContainersAroundTheseGuards() {
+        // the container actually on the test footage, check digit valid
+        Iso6346.Match match = Iso6346.scan(Iso6346.normalize("tex TGBU 355853 7 22G1"));
+        assertNotNull(match);
+        assertEquals("TGBU3558537", match.value);
+        assertTrue(match.checksumValid);
+    }
 }

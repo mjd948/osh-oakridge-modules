@@ -15,6 +15,19 @@ public final class Iso6346 {
     private static final Pattern CONTAINER_PATTERN = Pattern.compile("^[A-Z]{3}[UJZ]\\d{7}$");
     private static final Pattern NON_ALNUM = Pattern.compile("[^A-Z0-9]");
 
+    // A camera's burned-in OSD banner otherwise manufactures container numbers.
+    // "L102 REAR CAM 2026-03-28 11:56:32" normalizes to a digit-rich string in
+    // which the window "CAM2026032" + "8" coerces to CAMZ0260328 — the exact
+    // ISO 6346 shape — so every clip from a camera with a timestamp overlay
+    // yields a bogus operator suggestion. Container numbers never contain a
+    // colon or a calendar date, so dropping those substrings costs nothing and
+    // leaves any genuine text sharing the line intact.
+    private static final Pattern TIMESTAMP = Pattern.compile(
+            "\\d{4}[-/]\\d{2}[-/]\\d{2}"        // 2026-03-28, 2026/03/28
+                    + "|\\d{2}[-/]\\d{2}[-/]\\d{4}"  // 28-03-2026
+                    + "|\\d{1,2}:\\d{2}(?::\\d{2})?" // 11:56:32, 11:56
+    );
+
     // ISO 6346 letter values count up from A=10 but never use multiples of 11
     // (11, 22 and 33 are unassigned), so the sequence jumps at K->L and U->V.
     private static final int[] LETTER_VALUES = {
@@ -24,11 +37,22 @@ public final class Iso6346 {
 
     private Iso6346() {}
 
-    /** Uppercases and strips every character outside [A-Z0-9]. */
+    /** Removes burned-in calendar dates and clock times (camera OSD overlays). */
+    public static String stripTimestamps(String raw) {
+        if (raw == null)
+            return "";
+        return TIMESTAMP.matcher(raw).replaceAll(" ");
+    }
+
+    /**
+     * Drops burned-in timestamps, then uppercases and strips every character
+     * outside [A-Z0-9]. Every container scan funnels through here, so this is
+     * the one place the OSD-banner text has to be dealt with.
+     */
     public static String normalize(String raw) {
         if (raw == null)
             return "";
-        return NON_ALNUM.matcher(raw.toUpperCase()).replaceAll("");
+        return NON_ALNUM.matcher(stripTimestamps(raw).toUpperCase()).replaceAll("");
     }
 
     /**
@@ -120,12 +144,18 @@ public final class Iso6346 {
 
         Match patternOnly = null;
         for (int i = 0; i + LENGTH <= normalized.length(); i++) {
-            String window = coerceByPosition(normalized.substring(i, i + LENGTH));
+            String source = normalized.substring(i, i + LENGTH);
+            String window = coerceByPosition(source);
             if (!matchesPattern(window))
                 continue;
             if (isValid(window))
                 return new Match(window, true);
-            if (patternOnly == null)
+            // With no check digit to vouch for it, a window whose category
+            // identifier was manufactured by coercion is not trustworthy: '2'
+            // is the only digit that coerces to a valid category (Z), so this
+            // is nearly always a run of digits that happened to follow three
+            // letters rather than a Z-category container read as a digit.
+            if (patternOnly == null && !Character.isDigit(source.charAt(3)))
                 patternOnly = new Match(window, false);
         }
         return patternOnly;
