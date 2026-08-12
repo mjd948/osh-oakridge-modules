@@ -105,6 +105,12 @@ public class LaneSystem extends SensorSystem {
     protected void doInit() throws SensorHubException {
         threadPool = Executors.newSingleThreadExecutor();
         ffmpegConfigs = new HashMap<>();
+        // Re-init replaces the wrapper, so cancel the outgoing one's event-bus
+        // subscriptions first — dropping the reference alone would leave an
+        // orphan listening for occupancies and recording alongside its
+        // replacement.
+        if (occupancyWrapper != null)
+            occupancyWrapper.stop();
         occupancyWrapper = null;
 
         // generate unique ID

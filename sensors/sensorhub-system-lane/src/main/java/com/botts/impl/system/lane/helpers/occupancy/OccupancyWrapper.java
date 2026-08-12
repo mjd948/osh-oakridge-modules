@@ -229,9 +229,27 @@ public class OccupancyWrapper {
     }
 
     public void addFFmpegSensor(FFMPEGSensorBase<?> sensor) {
-        if (!cameras.contains(sensor)) {
-            cameras.add(sensor);
-        }
+        if (sensor == null)
+            return;
+
+        // Deduplicate by camera UID, not object identity: a camera module
+        // restart can hand LaneSystem's STATE_CHANGED handler a different
+        // object for the same physical camera, and contains() then lets the
+        // stale one linger. Two entries mean the occupancy issues two record
+        // commands a few ms apart, which resolve to the same timestamped file
+        // name — the loser dies on FileAlreadyExistsException and BOTH end up
+        // contributing an empty path to the occupancy, so the operator sees an
+        // alarm with no video at all.
+        cameras.removeIf(existing -> sameCamera(existing, sensor));
+        cameras.add(sensor);
+    }
+
+    private static boolean sameCamera(FFMPEGSensorBase<?> a, FFMPEGSensorBase<?> b) {
+        if (a == b)
+            return true;
+        String uidA = a != null ? a.getUniqueIdentifier() : null;
+        String uidB = b != null ? b.getUniqueIdentifier() : null;
+        return uidA != null && uidA.equals(uidB);
     }
 
     public void setRpmSensor(IDataProducerModule<?> sensor) {
@@ -275,9 +293,11 @@ public class OccupancyWrapper {
     }
 
     public void removeFFmpegSensor(FFMPEGSensorBase<?> sensor) {
-        if (cameras.contains(sensor)) {
-            cameras.remove(sensor);
-        }
+        if (sensor == null)
+            return;
+        // Match addFFmpegSensor: remove by UID so a restarted module's new
+        // object still evicts the entry its predecessor left behind.
+        cameras.removeIf(existing -> sameCamera(existing, sensor));
     }
 
     public void clearFFmpegSensors() {
