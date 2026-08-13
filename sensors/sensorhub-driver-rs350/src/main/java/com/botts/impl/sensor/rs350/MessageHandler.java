@@ -46,7 +46,9 @@ public class MessageHandler {
 
     private final String messageDelimiter;
 
-    private long timeSinceLastMessage;
+    /** Wall-clock stamp of the last message read from the detector; read by
+     *  the sensor's heartbeat from another thread, hence volatile. */
+    private volatile long lastMessageTimeMs;
 
 
     public interface StatusListener {
@@ -94,7 +96,7 @@ public class MessageHandler {
             try {
 
                 ArrayList<Character> buffer = new ArrayList<>();
-                timeSinceLastMessage = 0;
+                lastMessageTimeMs = System.currentTimeMillis();
 
                 while (continueProcessing) {
 
@@ -123,6 +125,11 @@ public class MessageHandler {
                         }
 
                         String n42Message = sb.toString().replaceAll("\\<\\?xml(.+?)\\?\\>", "").trim();
+
+                        // A complete message off the wire is the only proof
+                        // the detector is still talking — this stamp is what
+                        // RS350Sensor.heartbeat() reports as isConnected.
+                        lastMessageTimeMs = System.currentTimeMillis();
 
                         synchronized (messageQueue) {
 
@@ -225,6 +232,10 @@ public class MessageHandler {
         var bucketService = parentSensor.getParentHub().getModuleRegistry().getModuleByType(IBucketService.class);
         bucketStore = bucketService.getBucketStore();
 
+        // Stamp before the reader starts: a detector that never sends a byte
+        // must age out from module start, not from the epoch.
+        lastMessageTimeMs = System.currentTimeMillis();
+
         this.messageReader.start();
         this.messageNotifier.start();
     }
@@ -269,8 +280,9 @@ public class MessageHandler {
         }
     }
 
+    /** Milliseconds since the detector last delivered a message. */
     public long getTimeSinceLastMessage() {
-        return timeSinceLastMessage;
+        return System.currentTimeMillis() - lastMessageTimeMs;
     }
 
     private void publishWebIdRequest(String n42) {
