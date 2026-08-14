@@ -62,37 +62,54 @@ public class VideoKeyframeDecimator implements DataBufferListener {
         avFormatContext = new AVFormatContext(null);
         avformat.avformat_alloc_output_context2(avFormatContext, null, "mp4", null);
 
-        avStream = avformat.avformat_new_stream(avFormatContext, null);
-        avcodec.avcodec_parameters_copy(avStream.codecpar(), otherStream.codecpar());
-        FFmpegUtils.cleanCodecParameters(avStream.codecpar());
+        try {
+            avStream = avformat.avformat_new_stream(avFormatContext, null);
 
-        avStream.codecpar().format(otherStream.codecpar().format());
-        avStream.codecpar().extradata(otherStream.codecpar().extradata());
-        avStream.codecpar().extradata_size(otherStream.codecpar().extradata_size());
-
-        if ((avFormatContext.oformat().flags() & AVFMT_NOFILE) == 0) {
-            AVIOContext avioContext = new AVIOContext(null);
-            if (avio_open(avioContext, fileName, AVIO_FLAG_WRITE) < 0) {
-                throw new RuntimeException("Could not open file.");
+            // This deep-copies the extradata into a buffer owned by our codecpar, which is what
+            // lets closeFile() free the context. Do not "helpfully" re-point extradata at the
+            // input stream's buffer afterwards: that leaks this copy and leaves the input's
+            // buffer with two owners, so freeing this context would free memory that
+            // avformat_close_input() on the input then frees a second time.
+            int ret = avcodec.avcodec_parameters_copy(avStream.codecpar(), otherStream.codecpar());
+            if (ret < 0) {
+                throw new RuntimeException("Could not copy codec parameters for file " + fileName);
             }
-            avFormatContext.pb(avioContext);
-        }
+            FFmpegUtils.cleanCodecParameters(avStream.codecpar());
 
-        avformat.avformat_write_header(avFormatContext, (AVDictionary) null);
+            avStream.codecpar().format(otherStream.codecpar().format());
 
-        timeBase = avStream.time_base();
-        duration = av_rescale_q(otherStream.duration(), otherStream.time_base(), avStream.time_base());
-        //avStream.time_base(timeBase);
-        //avStream.duration(duration);
-        //avFormatContext.duration(duration);
+            if ((avFormatContext.oformat().flags() & AVFMT_NOFILE) == 0) {
+                AVIOContext avioContext = new AVIOContext(null);
+                if (avio_open(avioContext, fileName, AVIO_FLAG_WRITE) < 0) {
+                    throw new RuntimeException("Could not open file.");
+                }
+                avFormatContext.pb(avioContext);
+            }
 
-        if (timeBase != null) {
-            var frameRate = avutil.av_make_q(totalKeyframe * timeBase.den(), (int) duration * timeBase.num());
-            avStream.avg_frame_rate(frameRate);
-            avStream.r_frame_rate(frameRate);
-        }
-        else {
-            avStream.avg_frame_rate(avutil.av_make_q(30, 1));
+            avformat.avformat_write_header(avFormatContext, (AVDictionary) null);
+
+            timeBase = avStream.time_base();
+            duration = av_rescale_q(otherStream.duration(), otherStream.time_base(), avStream.time_base());
+            //avStream.time_base(timeBase);
+            //avStream.duration(duration);
+            //avFormatContext.duration(duration);
+
+            if (timeBase != null) {
+                var frameRate = avutil.av_make_q(totalKeyframe * timeBase.den(), (int) duration * timeBase.num());
+                avStream.avg_frame_rate(frameRate);
+                avStream.r_frame_rate(frameRate);
+            }
+            else {
+                avStream.avg_frame_rate(avutil.av_make_q(30, 1));
+            }
+        } catch (Throwable t) {
+            // The constructor throwing means no one is left holding this decimator, so nothing
+            // will ever call closeFile() to release the context. VideoRetention logs the failure
+            // and moves on to the next file a minute later, so leaking here would accumulate just
+            // as fast as the close-path leak this guards.
+            isWriting = false;
+            freeOutputContext();
+            throw t;
         }
     }
 
@@ -139,13 +156,42 @@ public class VideoKeyframeDecimator implements DataBufferListener {
             if (isWriting) {
                 isWriting = false;
                 avformat.av_write_trailer(avFormatContext);
-                avformat.avio_close(avFormatContext.pb());
+                freeOutputContext();
 
                 if (closeCallback != null) {
                     closeCallback.run();
                 }
             }
         }
+    }
+
+    /**
+     * Releases the output context and everything it owns: the AVIOContext opened in
+     * {@link #openOutputFile}, the stream, and the stream's codec parameters and extradata.
+     * <p>
+     * Closing the AVIOContext alone used to be the whole of the cleanup, so the context itself
+     * leaked on every decimation; VideoRetention decimates on a one-minute schedule, which is
+     * tens of thousands of leaked contexts a month on the node.
+     * <p>
+     * Callers must hold {@link #lock} and must have already cleared {@link #isWriting}, so this
+     * runs exactly once and no writer can be midway through the context. {@link #avStream} and
+     * {@link #timeBase} belong to the context and are dangling the moment it is freed, so the
+     * handles are nulled: a stray read afterwards then fails loudly with a NullPointerException
+     * instead of quietly reading freed native memory.
+     */
+    private void freeOutputContext() {
+        if (avFormatContext == null || avFormatContext.isNull())
+            return;
+
+        AVIOContext pb = avFormatContext.pb();
+        if (pb != null && !pb.isNull())
+            avformat.avio_close(pb);
+
+        avformat.avformat_free_context(avFormatContext);
+
+        avFormatContext = null;
+        avStream = null;
+        timeBase = null;
     }
 
     @Override
