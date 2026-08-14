@@ -150,9 +150,12 @@ public class MpegTsProcessor extends Thread {
     protected static final int INVALID_STREAM_ID = -1;
 
     /**
-     * Context used by underlying ffmpeg library to decode stream
+     * Context used by underlying ffmpeg library to decode stream.
+     * <p>
+     * Volatile because the demuxing thread reads it on every packet while another thread
+     * may be tearing it down in {@link MpegTsProcessor#closeStream()}.
      */
-    private AVFormatContext avFormatContext;
+    private volatile AVFormatContext avFormatContext;
 
     /**
      * Codec context, holds information about the codec used in transport stream
@@ -182,7 +185,7 @@ public class MpegTsProcessor extends Thread {
     /**
      * Flag indicating whether or not the stream has been opened or connected to successfully
      */
-    private boolean streamOpened = false;
+    private volatile boolean streamOpened = false;
 
     /**
      * A string representation of the file or url to use as the source of the transport stream to
@@ -222,6 +225,12 @@ public class MpegTsProcessor extends Thread {
 
     private static final long RECONNECT_INITIAL_DELAY_MS = 1000;
     private static final long RECONNECT_MAX_DELAY_MS = 30000;
+    /**
+     * How long {@link MpegTsProcessor#closeStream()} waits for the demuxing thread to leave
+     * the read loop before giving up. Reads are already bounded by the ffmpeg "timeout"
+     * option, so this only needs to be comfortably larger than that.
+     */
+    private static final long CLOSE_JOIN_TIMEOUT_MS = 30000;
     /** A session that survives this long resets the reconnect backoff. */
     private static final long RECONNECT_STABLE_MS = 10000;
 
@@ -917,7 +926,13 @@ public class MpegTsProcessor extends Thread {
         int retCode;
         boolean doProcessing = true;
 
-        while (!terminateProcessing.get() && (retCode = av_read_frame(avFormatContext, avPacket)) >= 0) {
+        // The context guard is belt-and-braces against a teardown that slipped past the join
+        // in closeStream(); it narrows the window rather than closing it, so the join is what
+        // actually makes this safe.
+        AVFormatContext readContext;
+        while (!terminateProcessing.get()
+                && (readContext = avFormatContext) != null && !readContext.isNull()
+                && (retCode = av_read_frame(readContext, avPacket)) >= 0) {
             // Discard the frame if no listeners are writing and we're not writing to a frame buffer
             boolean isWriting = hasWritingListener();
             //boolean isWritingFile = hasWritingListener(FileOutput.MP4Output.class);
@@ -1020,20 +1035,66 @@ public class MpegTsProcessor extends Thread {
 
     /**
      * Closes the transport stream, releasing allocated resources including the codec context.
+     * <p>
+     * Freeing the {@link AVFormatContext} while the demuxing thread is inside
+     * {@code av_read_frame} is a use-after-free that takes the whole JVM down with a SIGSEGV:
+     * JavaCPP's {@code avformat_close_input} binding is {@code @ByPtrPtr}, so it frees the
+     * struct <em>and</em> zeroes this object's own pointer, and the next read dereferences
+     * NULL. So when called from any thread other than the demuxing thread, this method first
+     * signals termination and waits for that thread to leave the read loop.
+     * <p>
+     * Every caller of this method intends permanent teardown; the reconnect path frees the
+     * context directly in {@link MpegTsProcessor#reopenStream()} and is unaffected.
      */
     public void closeStream() {
 
         logger.debug("closeStream");
 
-        if (streamOpened) {
+        // Ask the demuxing thread to stop before touching anything it is reading.
+        loop = false;
+        terminateProcessing.set(true);
 
-            closeCodecContext();
-
-            if (null != avFormatContext) {
-                avformat.avformat_close_input(avFormatContext);
+        if (Thread.currentThread() != this && isAlive()) {
+            boolean interrupted = false;
+            long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(CLOSE_JOIN_TIMEOUT_MS);
+            while (isAlive()) {
+                long remainingMs = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime());
+                if (remainingMs <= 0)
+                    break;
+                try {
+                    join(remainingMs);
+                } catch (InterruptedException e) {
+                    // A caller closing from one of our own listener threads gets interrupted
+                    // by shutdownExecutors() as the demuxing thread winds down. Keep waiting;
+                    // the flag is restored below.
+                    interrupted = true;
+                }
             }
+            if (interrupted)
+                Thread.currentThread().interrupt();
 
-            streamOpened = false;
+            if (isAlive()) {
+                // Reads are bounded by the ffmpeg "timeout" option, so this should not happen.
+                // Leaking the context is survivable; freeing it under a live reader is not.
+                logger.error("Stream processor for {} still running after {} ms; leaking the " +
+                        "AVFormatContext rather than freeing it underneath an active read",
+                        streamSource, CLOSE_JOIN_TIMEOUT_MS);
+                return;
+            }
+        }
+
+        synchronized (contextLock) {
+            if (streamOpened) {
+
+                closeCodecContext();
+
+                if (null != avFormatContext) {
+                    avformat.avformat_close_input(avFormatContext);
+                }
+
+                avFormatContext = null;
+                streamOpened = false;
+            }
         }
     }
 

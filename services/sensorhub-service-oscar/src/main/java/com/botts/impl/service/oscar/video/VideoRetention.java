@@ -10,11 +10,14 @@ import org.slf4j.LoggerFactory;
 
 import java.nio.file.Paths;
 import java.time.temporal.TemporalAmount;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 public class VideoRetention {
 
     private static final Logger logger = LoggerFactory.getLogger(VideoRetention.class);
+
+    /** Anything smaller than this is an mp4 header with no usable video in it. */
+    static final long MIN_VALID_DECIMATED_BYTES = 4096;
+
     final IBucketStore bucketStore;
     volatile boolean hasStarted = false;
     int frameCount;
@@ -102,7 +105,6 @@ public class VideoRetention {
 
         MpegTsProcessor videoInput = new MpegTsProcessor(originalMp4);
         VideoKeyframeDecimator videoOutput = null;
-        AtomicBoolean inputClosed = new AtomicBoolean(false);
         boolean success = false;
         try {
             videoInput.setInjectExtradata(false);
@@ -116,12 +118,11 @@ public class VideoRetention {
             videoOutput = new VideoKeyframeDecimator(decimatedMp4, frameCount, stream);
             videoInput.addVideoDataBufferListener(videoOutput);
 
-            videoOutput.setFileCloseCallback(() -> {
-                if (inputClosed.compareAndSet(false, true)) {
-                    videoInput.stopProcessingStream();
-                    videoInput.closeStream();
-                }
-            });
+            // Only signal the demuxer to wind down. The input must not be closed from here:
+            // this callback runs on the listener executor thread while STREAM-PROCESSOR is
+            // still inside av_read_frame, and freeing the AVFormatContext underneath it
+            // segfaults the JVM. The close belongs after join(), in the finally block.
+            videoOutput.setFileCloseCallback(videoInput::stopProcessingStream);
 
             videoInput.processStream();
 
@@ -129,21 +130,26 @@ public class VideoRetention {
                 videoInput.join();
             } catch (InterruptedException e) {
                 logger.warn("Interrupted while waiting for video processing to finish. Writing output early, stopping thread.", e);
-                videoOutput.closeFile();
+                videoInput.stopProcessingStream();
                 Thread.currentThread().interrupt();
             }
+
+            // A clip that reaches EOF before the keyframe quota never fires the close
+            // callback, so the trailer would never be written and the output would be an
+            // unplayable stub. Closing here is a no-op if the quota already closed it.
+            videoOutput.closeFile();
+
             success = true;
         } catch (Throwable t) {
             logger.error("Failed to decimate video file {}; skipping", originalMp4, t);
             return false;
         } finally {
-            if (inputClosed.compareAndSet(false, true)) {
-                try {
-                    videoInput.stopProcessingStream();
-                    videoInput.closeStream();
-                } catch (Throwable t) {
-                    logger.warn("Failed to close video input for {}", originalMp4, t);
-                }
+            // Safe here: the processing thread has been joined, or was never started.
+            try {
+                videoInput.stopProcessingStream();
+                videoInput.closeStream();
+            } catch (Throwable t) {
+                logger.warn("Failed to close video input for {}", originalMp4, t);
             }
             if (!success) {
                 var partial = Paths.get(decimatedMp4).toFile();
@@ -156,8 +162,26 @@ public class VideoRetention {
         // TODO May be nice to rename objects through the bucket store
         var decimatedFile = Paths.get(decimatedMp4).toFile();
         var originalFile = Paths.get(originalMp4).toFile();
-        originalFile.delete();
-        decimatedFile.renameTo(originalFile);
+
+        // Never destroy the original for an output we cannot vouch for. A header-only mp4
+        // (no trailer, no frames) is a few hundred bytes and is what previously replaced
+        // thousands of clips.
+        if (!decimatedFile.isFile() || decimatedFile.length() < MIN_VALID_DECIMATED_BYTES) {
+            logger.warn("Decimated file {} is missing or too small ({} bytes); keeping original {}",
+                    decimatedMp4, decimatedFile.isFile() ? decimatedFile.length() : 0, originalMp4);
+            if (decimatedFile.exists() && !decimatedFile.delete())
+                logger.warn("Failed to delete unusable decimated file {}", decimatedMp4);
+            return false;
+        }
+
+        if (!originalFile.delete()) {
+            logger.warn("Failed to delete original video file {}; leaving decimated copy at {}", originalMp4, decimatedMp4);
+            return false;
+        }
+        if (!decimatedFile.renameTo(originalFile)) {
+            logger.error("Failed to rename {} over {}", decimatedMp4, originalMp4);
+            return false;
+        }
         return true;
     }
 }
