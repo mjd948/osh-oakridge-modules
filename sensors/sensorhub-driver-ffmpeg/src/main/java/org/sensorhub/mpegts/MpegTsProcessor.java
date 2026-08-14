@@ -379,12 +379,56 @@ public class MpegTsProcessor extends Thread {
         }
     }
 
+    /**
+     * @return the video stream of the open input, or null if no stream is open.
+     * <p>
+     * The returned {@link AVStream} lives inside the input {@link AVFormatContext} and is freed
+     * along with it whenever the session is re-established in
+     * {@link MpegTsProcessor#reopenStream()}. Neither it nor its {@code @ByRef} members --
+     * {@code time_base()} and {@code avg_frame_rate()} return pointers into the struct, not
+     * values -- may be cached across a reconnect. Use {@link MpegTsProcessor#getInputTimeBase()}
+     * and {@link MpegTsProcessor#getInputFrameRate()}, which hand back copies that stay valid.
+     */
     public AVStream getAvStream() {
         synchronized (contextLock) {
             if (!streamOpened || avFormatContext == null || videoStreamId == INVALID_STREAM_ID)
                 return null;
             return avFormatContext.streams(videoStreamId);
         }
+    }
+
+    /**
+     * @return a copy of the video stream's time base, or null if no stream is open or the
+     *         stream declares no usable time base.
+     */
+    public AVRational getInputTimeBase() {
+        synchronized (contextLock) {
+            AVStream stream = getAvStream();
+            return stream == null ? null : copyRational(stream.time_base());
+        }
+    }
+
+    /**
+     * @return a copy of the video stream's average frame rate, or null if no stream is open or
+     *         the stream declares no usable frame rate.
+     */
+    public AVRational getInputFrameRate() {
+        synchronized (contextLock) {
+            AVStream stream = getAvStream();
+            return stream == null ? null : copyRational(stream.avg_frame_rate());
+        }
+    }
+
+    /**
+     * Copies a rational out of the input context so the value outlives the context, rejecting
+     * the zeroes ffmpeg leaves on fields the container never declared.
+     *
+     * @return an independent copy, or null if the source holds no usable ratio.
+     */
+    private static AVRational copyRational(AVRational rational) {
+        if (rational == null || rational.num() <= 0 || rational.den() <= 0)
+            return null;
+        return av_make_q(rational.num(), rational.den());
     }
 
     /**

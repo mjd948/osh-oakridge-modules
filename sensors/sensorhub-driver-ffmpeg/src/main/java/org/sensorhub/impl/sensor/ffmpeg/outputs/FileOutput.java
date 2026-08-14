@@ -65,9 +65,17 @@ public class FileOutput<FFMPEGConfigType extends FFMPEGConfig> extends AbstractS
 
     AVStream outputVideoStream;
     OutputStream outputStream;
-    AVRational timeBase = new AVRational();
-    AVRational inputTimeBase = new AVRational();
-    AVRational inputFrameRate = new AVRational();
+
+    // These three must always point at memory this class owns, which is what final buys here.
+    // AVStream.time_base() and avg_frame_rate() return @ByRef pointers *into* an
+    // AVFormatContext, and every context these values come from is freed underneath us: the
+    // input context on each RTSP reconnect (MpegTsProcessor.reopenStream), the output context
+    // on each clip rotation (closeFile). All three are read on the listener thread outside
+    // contextLock, so caching a pointer instead of the value is a use-after-free that takes the
+    // JVM down with it. Copy num/den in; never assign one of these from a native getter.
+    final AVRational timeBase = av_make_q(1, 90000);
+    final AVRational inputTimeBase = av_make_q(1, 90000);
+    final AVRational inputFrameRate = av_make_q(30, 1);
 
     final int MAX_PACKET_QUEUE_SIZE = 1000;
     volatile long filePts;
@@ -196,20 +204,22 @@ public class FileOutput<FFMPEGConfigType extends FFMPEGConfig> extends AbstractS
                     throw new IOException("Already writing to file " + this.fileName);
                 }
 
-                var inStream = parentSensor.getProcessor().getAvStream();
-                if (inStream != null) {
-                    if ((inputTimeBase = inStream.time_base()) == null) {
-                        inputTimeBase = av_make_q(1, 90000);
-                        logger.warn("Could not get input timebase; using default timebase of 1/90k");
-                    }
-                    if ((inputFrameRate = inStream.avg_frame_rate()) == null) {
-                        inputFrameRate = av_make_q(30, 1);
-                        logger.warn("Could not get input framerate; using default framerate of 30fps");
-                    }
+                // Copies, not the demuxer's own AVRationals: the input context they live in is
+                // freed and replaced on every reconnect, long before this file is closed.
+                var inTimeBase = parentSensor.getProcessor().getInputTimeBase();
+                if (inTimeBase != null) {
+                    setRational(inputTimeBase, inTimeBase.num(), inTimeBase.den());
                 } else {
-                    inputTimeBase = av_make_q(1, 90000);
-                    inputFrameRate = av_make_q(30, 1);
-                    logger.warn("Could not get input stream; using default timebase of 1/90k and framerate of 30fps");
+                    setRational(inputTimeBase, 1, 90000);
+                    logger.warn("Could not get input timebase; using default timebase of 1/90k");
+                }
+
+                var inFrameRate = parentSensor.getProcessor().getInputFrameRate();
+                if (inFrameRate != null) {
+                    setRational(inputFrameRate, inFrameRate.num(), inFrameRate.den());
+                } else {
+                    setRational(inputFrameRate, 30, 1);
+                    logger.warn("Could not get input framerate; using default framerate of 30fps");
                 }
 
                 initCtx(avCodecParameters);
@@ -251,7 +261,10 @@ public class FileOutput<FFMPEGConfigType extends FFMPEGConfig> extends AbstractS
                     throw new IOException("Could not write header to file.");
                 }
 
-                timeBase = outputVideoStream.time_base();
+                // avformat_write_header may have rewritten the stream's time base, so re-read
+                // it -- by value, since outputVideoStream is freed with outputContext.
+                var outTimeBase = outputVideoStream.time_base();
+                setRational(timeBase, outTimeBase.num(), outTimeBase.den());
 
                 doFileWrite.set(true);
                 av_log_set_level(AV_LOG_QUIET);
@@ -304,7 +317,7 @@ public class FileOutput<FFMPEGConfigType extends FFMPEGConfig> extends AbstractS
         }
         //FFmpegUtils.cleanCodecParameters(outputVideoStream.codecpar());
 
-        timeBase = av_make_q(1, 90000);
+        setRational(timeBase, 1, 90000);
 
         // We're transcoding, need to override some of the copied values
         outputVideoStream.codecpar().codec_id(AV_CODEC_ID_H264);
@@ -321,6 +334,11 @@ public class FileOutput<FFMPEGConfigType extends FFMPEGConfig> extends AbstractS
 
         outputContext.start_time(0);
         outputContext.position(0);
+    }
+
+    /** Writes a ratio into a rational we own, so no pointer into a foreign context is kept. */
+    private static void setRational(AVRational dst, int num, int den) {
+        dst.num(num).den(den);
     }
 
     private void logFFmpeg(int retCode) {
@@ -364,7 +382,7 @@ public class FileOutput<FFMPEGConfigType extends FFMPEGConfig> extends AbstractS
 
     /** One frame interval in output time base units, from the input frame rate. */
     private long nominalFrameDuration() {
-        if (inputFrameRate != null && inputFrameRate.num() > 0 && inputFrameRate.den() > 0 && timeBase.num() > 0) {
+        if (inputFrameRate.num() > 0 && inputFrameRate.den() > 0 && timeBase.num() > 0) {
             long duration = ((long) timeBase.den() * inputFrameRate.den()) / ((long) timeBase.num() * inputFrameRate.num());
             if (duration > 0)
                 return duration;
