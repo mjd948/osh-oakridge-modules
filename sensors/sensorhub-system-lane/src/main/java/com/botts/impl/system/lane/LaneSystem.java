@@ -15,6 +15,8 @@
 
 package com.botts.impl.system.lane;
 
+import com.botts.impl.system.lane.helpers.RpmRecoverySupervisor;
+
 
 import com.botts.impl.process.d5.occupancy.D5OccupancyProcessConfig;
 import com.botts.impl.process.d5.occupancy.D5OccupancyProcessModule;
@@ -93,12 +95,13 @@ public class LaneSystem extends SensorSystem implements IAutoStartDispatchStatus
     public static final String EXTENDED_OCCUPANCY_THRESHOLD_KEYWORD_PREFIX = "oscar:extended-occupancy-threshold-min:";
     private static final String OPERATIONAL_VIEW_KEY_PATTERN = "[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?";
 
-    AbstractSensorModule<?> existingRPMModule = null;
+    volatile AbstractSensorModule<?> existingRPMModule = null;
     IDataProducerModule<?> occupancyProducer = null;
     Flow.Subscription subscription = null;
     private final Object subscriptionLock = new Object();
     private long subscriptionGeneration = 0;
     private ExecutorService threadPool = null;
+    private RpmRecoverySupervisor rpmRecovery = null;
     private volatile boolean autoStartDispatchComplete;
     Map<String, FFMPEGConfig> ffmpegConfigs = null;
     OccupancyWrapper occupancyWrapper;
@@ -478,6 +481,7 @@ public class LaneSystem extends SensorSystem implements IAutoStartDispatchStatus
     @Override
     protected void afterStart() throws SensorHubException {
         super.afterStart();
+        startRpmRecovery();
         if (existingRPMModule instanceof RS350Sensor || existingRPMModule instanceof D5Sensor) {
             // Reuse the occupancy process member if one is already attached (persisted
             // config or previous start); only create one on first setup
@@ -547,6 +551,7 @@ public class LaneSystem extends SensorSystem implements IAutoStartDispatchStatus
     }
 
     protected void doStop() throws SensorHubException {
+        stopRpmRecovery();
         cancelLaneEventSubscription();
         shutdownThreadPool();
         if (emlAutoAdjudicationHelper != null) {
@@ -571,6 +576,7 @@ public class LaneSystem extends SensorSystem implements IAutoStartDispatchStatus
 
     @Override
     public void cleanup() throws SensorHubException {
+        stopRpmRecovery();
         cancelLaneEventSubscription();
         shutdownThreadPool();
         if (emlAutoAdjudicationHelper != null) {
@@ -607,6 +613,20 @@ public class LaneSystem extends SensorSystem implements IAutoStartDispatchStatus
                 subscription.cancel();
                 subscription = null;
             }
+        }
+    }
+
+    private synchronized void startRpmRecovery() {
+        stopRpmRecovery();
+        rpmRecovery = new RpmRecoverySupervisor(() -> existingRPMModule,
+                () -> getCurrentState() == ModuleEvent.ModuleState.STARTED, getLogger());
+        rpmRecovery.start(getName());
+    }
+
+    private synchronized void stopRpmRecovery() {
+        if (rpmRecovery != null) {
+            rpmRecovery.close();
+            rpmRecovery = null;
         }
     }
 
