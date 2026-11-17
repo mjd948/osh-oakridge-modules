@@ -29,6 +29,7 @@ public class RS350Sensor extends AbstractSensorModule<RS350Config> {
     BackgroundOutput backgroundOutput;
     ForegroundOutput foregroundOutput;
     AlarmOutput alarmOutput;
+    LocationOutput locationOutput;
     ConnectionStatusOutput connectionStatusOutput;
 
     RobustConnection connection;
@@ -76,6 +77,12 @@ public class RS350Sensor extends AbstractSensorModule<RS350Config> {
             alarmOutput = new AlarmOutput(this);
             addOutput(alarmOutput, false);
             alarmOutput.init();
+        }
+
+        if (config.outputs.enableLocationOutput) {
+            locationOutput = new LocationOutput(this);
+            addOutput(locationOutput, false);
+            locationOutput.init();
         }
 
         connectionStatusOutput = new ConnectionStatusOutput(this);
@@ -154,6 +161,10 @@ public class RS350Sensor extends AbstractSensorModule<RS350Config> {
 
         if (config.outputs.enableAlarmOutput) {
             messageHandler.addAlarmListener(alarmOutput);
+        }
+
+        if (config.outputs.enableLocationOutput) {
+            messageHandler.addForegroundListener(locationOutput);
         }
     }
 

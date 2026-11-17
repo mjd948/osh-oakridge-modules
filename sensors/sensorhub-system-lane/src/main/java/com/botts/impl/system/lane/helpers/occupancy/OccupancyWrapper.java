@@ -1,5 +1,6 @@
 package com.botts.impl.system.lane.helpers.occupancy;
 
+import com.botts.impl.process.d5.occupancy.D5OccupancyProcessModule;
 import com.botts.impl.process.rs350.occupancy.Rs350OccupancyProcessModule;
 import com.botts.impl.sensor.aspect.AspectSensor;
 import com.botts.impl.sensor.rapiscan.RapiscanSensor;
@@ -86,6 +87,13 @@ public class OccupancyWrapper {
     private long occupancyEpoch = 0;
     private ScheduledFuture<?> extendedOccupancyFaultTimer = null;
     private volatile int extendedOccupancyThresholdMinutes = LaneConfig.DEFAULT_EXTENDED_OCCUPANCY_THRESHOLD_MINUTES;
+    /**
+     * False for lanes where occupancy duration does not mean "vehicle parked in the portal"
+     * (mobile detectors: an RS-350/D5 occupancy spans the whole alarm while the operator walks).
+     * When disabled no Extended Occupancy fault is raised and no gamma-only alarm is
+     * auto-adjudicated with Code 9998.
+     */
+    private volatile boolean extendedOccupancyMonitoringEnabled = true;
 
     public OccupancyWrapper(ISensorHub hub) {
         this(hub, (OccupancyStatusOutput) null);
@@ -458,6 +466,10 @@ public class OccupancyWrapper {
             return new RapiscanStateManager();
         } else if (sensor instanceof Rs350OccupancyProcessModule){
             return new Rs350StateManager();
+        } else if (sensor instanceof D5OccupancyProcessModule){
+            // The D5 process publishes the same dailyFile record as the RS350
+            // one, so the RS350 state manager's semantics apply as-is
+            return new Rs350StateManager();
         }
         return null;
     }
@@ -517,8 +529,21 @@ public class OccupancyWrapper {
                 extendedOccupancyThresholdMinutes));
     }
 
+    public void setExtendedOccupancyMonitoringEnabled(boolean enabled) {
+        this.extendedOccupancyMonitoringEnabled = enabled;
+        if (!enabled) {
+            synchronized (lifecycleLock) {
+                cancelExtendedOccupancyFaultTimerLocked();
+            }
+        }
+    }
+
+    public boolean isExtendedOccupancyMonitoringEnabled() {
+        return extendedOccupancyMonitoringEnabled;
+    }
+
     private boolean hasExceededExtendedOccupancyThreshold(Instant start, Instant sampleTime) {
-        if (start == null || sampleTime == null)
+        if (!extendedOccupancyMonitoringEnabled || start == null || sampleTime == null)
             return false;
         return !sampleTime.isBefore(start.plus(getExtendedOccupancyThreshold()));
     }
@@ -532,7 +557,7 @@ public class OccupancyWrapper {
 
     private void scheduleExtendedOccupancyFaultTimerLocked(long expectedOccupancyEpoch, Instant activeStart, Instant observationTime) {
         cancelExtendedOccupancyFaultTimerLocked();
-        if (!started || activeStart == null)
+        if (!started || activeStart == null || !extendedOccupancyMonitoringEnabled)
             return;
         Duration threshold = getExtendedOccupancyThreshold();
         Duration elapsed = observationTime != null && observationTime.isAfter(activeStart)
@@ -622,7 +647,7 @@ public class OccupancyWrapper {
     }
 
     void evaluateCompletedOccupancy(Occupancy occupancy) {
-        if (occupancy == null)
+        if (occupancy == null || !extendedOccupancyMonitoringEnabled)
             return;
 
         double thresholdSeconds = getExtendedOccupancyThreshold().toSeconds();
