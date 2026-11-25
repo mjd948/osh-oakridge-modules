@@ -29,7 +29,7 @@ public class RpmRecoverySupervisorTest {
         FakeRpm() {
             var config = new ModuleConfig();
             config.id = "rpm-1";
-            config.name = "Selfridge - RPM";
+            config.name = "Lane01 - RPM";
             config.autoStart = true;
             setConfiguration(config);
         }

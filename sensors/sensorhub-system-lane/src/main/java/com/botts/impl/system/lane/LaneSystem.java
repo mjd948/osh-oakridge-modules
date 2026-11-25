@@ -534,6 +534,17 @@ public class LaneSystem extends SensorSystem implements IAutoStartDispatchStatus
             } else {
                 var processConfig = createOccupancyProcessConfig(existingRPMModule);
                 occupancyProducer = (IDataProducerModule<?>) registerSubmodule(processConfig);
+                if (existingRPMModule.getCurrentState() == ModuleEvent.ModuleState.STARTED) {
+                    // The detector is already up, so its STARTED event has passed: initialize
+                    // and start the new process now instead of waiting for one
+                    if (occupancyProducer instanceof Rs350OccupancyProcessModule rs350Process)
+                        rs350Process.getConfiguration().systemUID = existingRPMModule.getUniqueIdentifier();
+                    else if (occupancyProducer instanceof D5OccupancyProcessModule d5Process)
+                        d5Process.getConfiguration().systemUID = existingRPMModule.getUniqueIdentifier();
+                    occupancyProducer.init();
+                    OccupancyProcessStarter.startIfStranded(occupancyProducer, isStarted(),
+                            autoStartDispatchComplete, threadPool, getLogger());
+                }
             }
         } else {
             occupancyProducer = existingRPMModule;
@@ -589,12 +600,15 @@ public class LaneSystem extends SensorSystem implements IAutoStartDispatchStatus
     }
 
     /**
-     * Portal lanes, whose RPM is the occupancy producer and has a UID from init, so the EML helper
-     * subscribes at lane start. On RS-350/D5 lanes the occupancy process has no UID yet when the
-     * helper is created, so it never subscribes; re-attaching would newly enable it there.
+     * Whether {@link EmlAutoAdjudicationHelper} should be (re-)attached once the occupancy
+     * producer has initialized its UID (including RS-350 occupancy processes, whose UID is
+     * assigned asynchronously during {@code doInit()} so extended-occupancy auto-adjudication
+     * can bind once the process reaches {@code STARTED}).
      */
     private boolean emlReattachExpected() {
-        return occupancyProducer != null && occupancyProducer == existingRPMModule;
+        return occupancyProducer != null
+                && occupancyProducer.getUniqueIdentifier() != null
+                && !occupancyProducer.getUniqueIdentifier().isBlank();
     }
 
     private boolean webIdExpected() {
@@ -961,8 +975,12 @@ public class LaneSystem extends SensorSystem implements IAutoStartDispatchStatus
                             if (getUniqueIdentifier() != null)
                                 database = getParentHub().getSystemDriverRegistry().getDatabase(getUniqueIdentifier());
                             long systemAndMembers = 0;
-                            if (database != null)
-                                systemAndMembers = database.getSystemDescStore().select(new SystemFilter.Builder().withUniqueIDs(getUniqueIdentifier()).includeMembers(true).build()).count();
+                            if (database != null) {
+                                try (var systemStream = database.getSystemDescStore().select(
+                                        new SystemFilter.Builder().withUniqueIDs(getUniqueIdentifier()).includeMembers(true).build())) {
+                                    systemAndMembers = systemStream.count();
+                                }
+                            }
                             // Only delete from database if lane doesn't have children
                             if (systemAndMembers == 1) {
                                 var transactionHandler = new SystemDatabaseTransactionHandler(getParentHub().getEventBus(), database);
